@@ -1,0 +1,9 @@
+{
+  "id": "read-aloud",
+  "name": "Read Aloud",
+  "description": "Adds a read-aloud button to assistant replies, spoken with the TTS provider in Paseo's voice settings (local Kokoro or OpenAI TTS).",
+  "requirements": {
+    "paseo": ">=0.15.0"
+  },
+  "build": [["npm", "ci", "--omit=dev", "--ignore-scripts"]]
+}
