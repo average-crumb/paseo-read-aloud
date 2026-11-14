@@ -43,6 +43,6 @@ pick up the voice settings and to find its own installed files.
 ## Limitations
 
 - One reply is read at a time; starting another stops the current one.
-- Stop takes effect at the end of the sentence being played.
+- Stop takes effect at the end of the current sentence group (about two sentences).
 - About 20,000 characters of a reply are read per press.
 - Languages are whatever the selected Paseo voice speaks.
