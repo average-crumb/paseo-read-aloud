@@ -54,10 +54,12 @@ export function toSpeech(markdown: string): string {
 }
 
 /**
- * Splits text into sentence-sized chunks so Stop takes effect soon. The first chunk is kept short
- * so speech starts quickly; later chunks are prepared while earlier ones play.
+ * Splits text into short chunks so Stop takes effect quickly. Paseo's playback queues audio and
+ * cannot interrupt a clip mid-play, so each chunk must stay short (about 10-12 characters per
+ * second of speech). The first chunk is kept especially short so speech starts quickly; later
+ * chunks are prepared while earlier ones play.
  */
-export function toChunks(text: string, maxSize = 280, firstSize = 110): string[] {
+export function toChunks(text: string, maxSize = 150, firstSize = 70): string[] {
   const sentences = text.match(/[^.!?;\n]+[.!?;]*["')\]]*\s*|\n/g) ?? [text];
   const chunks: string[] = [];
   let current = "";

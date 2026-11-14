@@ -7,6 +7,8 @@ import { readAloudSchema, synthesizeSpeech, toChunks, toSpeech, voiceStatus, typ
 
 type Props = PluginTimelineItemProps<z.output<typeof readAloudSchema>>;
 type State = "idle" | "loading" | "playing";
+type AudioData = z.output<typeof synthesizeSpeech.output>;
+
 
 /** Only one reply reads at a time; starting another stops the current one. */
 let activeStop: (() => void) | null = null;
@@ -61,6 +63,7 @@ export function createReadAloudRow(client: PluginClientContext) {
     const [pinned, setPinned] = useState(false);
     const voice = useVoiceStatus(client);
     const stopped = useRef(true);
+    const warm = useRef<Promise<AudioData | null> | null>(null);
     const toast = useToast();
     useEffect(() => () => {
       stopped.current = true;
@@ -76,10 +79,15 @@ export function createReadAloudRow(client: PluginClientContext) {
       activeStop = stop;
       const chunks = toChunks(toSpeech(item.data.text));
       const speak = (text: string) => client.rpc(synthesizeSpeech, { text });
+      // Reuse the first chunk prepared while the pointer hovered over the button.
+      const cached = warm.current;
+      warm.current = null;
       setState("loading");
       try {
         // Prepare the next sentence while the current one plays.
-        let next = chunks.length ? speak(chunks[0]) : null;
+        let next: Promise<AudioData> | null;
+        if (cached) next = cached.then((audio) => audio ?? speak(chunks[0]));
+        else next = chunks.length ? speak(chunks[0]) : null;
         for (let index = 0; index < chunks.length && next; index++) {
           const audio = await next;
           if (stopped.current) break;
@@ -124,7 +132,14 @@ export function createReadAloudRow(client: PluginClientContext) {
             } else if (busy) activeStop?.();
             else void play();
           }}
-          onHoverIn={() => setHovered(true)}
+          onHoverIn={() => {
+            setHovered(true);
+            // Synthesize the first chunk in the background so the first press speaks at once.
+            if (!warm.current && state === "idle" && !broken) {
+              const first = toChunks(toSpeech(item.data.text))[0];
+              if (first) warm.current = client.rpc(synthesizeSpeech, { text: first }).catch(() => null);
+            }
+          }}
           onHoverOut={() => setHovered(false)}
           style={({ pressed }) => ({
             paddingHorizontal: 8,
