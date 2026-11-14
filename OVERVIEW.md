@@ -1,32 +1,48 @@
 # Read Aloud
 
-Adds a speaker button to completed assistant replies in the agent timeline.
-Pressing it reads the reply out loud.
+Adds a small speaker button under each finished agent reply. Pressing it reads
+the reply out loud; pressing it again stops.
 
 ## How it works
 
-Synthesis runs in a daemon plugin subprocess using the TTS provider already
-configured in Paseo's voice settings (Settings > Voice > Text to speech).
-Local mode reuses the Kokoro (English) model Paseo already downloads, so there
-is no extra download; OpenAI mode calls the configured OpenAI-compatible TTS
-endpoint with the configured key and base URL. The resulting audio (WAV for
-local mode, MP3 for OpenAI mode) is sent to the client and played through
-Paseo's shared audio queue.
+When a turn completes, the plugin adds a button row below the turn's final
+reply. The reply itself is still drawn by Paseo, with its normal Markdown and
+copy button.
 
-The plugin has no settings of its own; all behavior follows Paseo's voice
-settings.
+Before speaking, the reply is turned into plain speech: code blocks are
+announced as "code block", links are read as their text, and Markdown marks,
+table pipes and emoji are dropped. The text is spoken a sentence or two at a
+time, preparing the next part while the current one plays.
+
+Speech always uses the voice Paseo's voice mode would use, chosen the same way
+Paseo chooses it: voice environment variables first, then Settings > Voice >
+Text to speech, then Paseo's default voice.
+
+- Local: whichever downloaded voice is selected (Kokoro, Kokoro Lite, Kitten or
+  Piper), with its speaker and speed. Voice files are located through Paseo's
+  own model catalog and run by Paseo's own speech runtime, with a bundled
+  WebAssembly copy as a fallback.
+- OpenAI: the configured OpenAI-compatible speech endpoint, key, model and
+  voice.
+
+Audio (WAV for local, MP3 for OpenAI) is played through Paseo's shared audio
+queue on the device you press it on.
+
+## Setup
+
+No settings of its own. For local speech, the selected voice must be downloaded
+in Paseo Settings > Voice. Replies that finished before the plugin was enabled have no
+button.
 
 ## Data
 
-Local mode keeps everything on-device. OpenAI mode sends the reply text (capped
-at 4000 characters) to the configured TTS endpoint. The plugin reads the
-daemon config only to pick up the TTS settings and locate the downloaded local
-model.
+Local mode keeps everything on the daemon host. OpenAI mode sends the spoken
+text to the configured endpoint. The plugin reads the daemon config file to
+pick up the voice settings and to find its own installed files.
 
 ## Limitations
 
-- One reply is read at a time; a second press is ignored while audio plays.
-- At most about 4000 characters of the reply are read per press.
-- Playback cannot be interrupted from the button.
-- Local mode is English-only (Kokoro English model) and requires the local TTS
-  model to be downloaded in Paseo Settings > Voice.
+- One reply is read at a time; starting another stops the current one.
+- Stop takes effect at the end of the sentence being played.
+- About 20,000 characters of a reply are read per press.
+- Languages are whatever the selected Paseo voice speaks.
