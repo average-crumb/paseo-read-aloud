@@ -6,13 +6,19 @@ import { READ_ALOUD_KIND } from "../shared/speech";
 const MAX_ROW_TEXT = 30_000;
 
 /**
+ * How far back to look for the start of the reply. Streamed replies can be stored as many small
+ * chunks, and tool calls sit between them, so 60 entries could cut off the start of a long one.
+ */
+const LOOKBACK = 500;
+
+/**
  * After each completed turn, add a Read aloud row holding the turn's final reply. The row is a
  * separate timeline item, so Paseo keeps rendering the reply itself (Markdown, code, copy button).
  */
 export async function addReadAloudRow(event: PluginHookPayload<"agent.turn.after">, { paseo }: PluginHookContext) {
   if (event.outcome.kind !== "completed") return;
   const timeline = paseo.agents.ref(event.agent.id).timeline;
-  const page = await timeline.refetch({ direction: "tail", limit: 60 });
+  const page = await timeline.refetch({ direction: "tail", limit: LOOKBACK });
   // The final reply is the last run of assistant text after the latest user message;
   // streamed replies can be stored as several consecutive chunks.
   const parts: string[] = [];

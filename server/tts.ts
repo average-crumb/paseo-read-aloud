@@ -1,36 +1,78 @@
 /// <reference types="node" />
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { createRequire } from "node:module";
 import { readDaemonConfig, requiredFiles, resolveVoice, type ResolvedVoice, type TtsEngine } from "./voices";
 
-type SpeechFile = { base64: string; mimeType: string };
+type SpeechFile = { base64: string; mimeType: string; durationMs?: number };
 type LocalVoice = Extract<ResolvedVoice, { provider: "local" }>;
 type OpenAiVoice = Extract<ResolvedVoice, { provider: "openai" }>;
 
 const PLUGIN_ID = "read-aloud";
 
+// ---------- Sessions ----------
+
+/** Sessions the client has stopped. Their queued chunks are skipped instead of generated. */
+const cancelled = new Set<string>();
+const inFlight = new Map<string, Set<AbortController>>();
+
+class Cancelled extends Error {
+  constructor() {
+    super("Read aloud was stopped");
+  }
+}
+
+function isCancelled(session: string | undefined): boolean {
+  return session !== undefined && cancelled.has(session);
+}
+
+/** Marks a session stopped and aborts its network requests. Keeps the set small. */
+export async function cancel({ session }: { session: string }): Promise<{ ok: boolean }> {
+  cancelled.add(session);
+  if (cancelled.size > 200) cancelled.delete(cancelled.values().next().value as string);
+  for (const controller of inFlight.get(session) ?? []) controller.abort();
+  inFlight.delete(session);
+  return { ok: true };
+}
+
 // ---------- OpenAI ----------
 
-async function synthesizeOpenAi(voice: OpenAiVoice, text: string): Promise<SpeechFile> {
+const OPENAI_TIMEOUT_MS = 60_000;
+
+async function synthesizeOpenAi(voice: OpenAiVoice, text: string, session?: string): Promise<SpeechFile> {
   if (!voice.apiKey) {
     throw new Error("OpenAI TTS is selected in Paseo's voice settings but no API key is configured");
   }
-  const request = fetch(voice.endpoint, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${voice.apiKey}` },
-    body: JSON.stringify({ model: voice.model, voice: voice.voice, input: text, response_format: "mp3" }),
-  });
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error("OpenAI TTS request timed out")), 60_000);
-  });
-  const response = await Promise.race([request, timeout]).finally(() => clearTimeout(timer));
-  if (!response.ok) {
-    const detail = (await response.text().catch(() => "")).slice(0, 200).trim();
-    throw new Error(`OpenAI TTS request failed (${response.status})${detail ? ": " + detail : ""}`);
+  const controller = new AbortController();
+  if (session) {
+    const set = inFlight.get(session) ?? new Set();
+    set.add(controller);
+    inFlight.set(session, set);
   }
-  return { base64: Buffer.from(await response.arrayBuffer()).toString("base64"), mimeType: "audio/mpeg" };
+  // The timeout aborts the request itself (and reading its body), rather than abandoning it.
+  const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(OPENAI_TIMEOUT_MS)]);
+  try {
+    const response = await fetch(voice.endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${voice.apiKey}` },
+      body: JSON.stringify({ model: voice.model, voice: voice.voice, input: text, response_format: "mp3" }),
+      signal,
+    });
+    if (!response.ok) {
+      const detail = (await response.text().catch(() => "")).slice(0, 200).trim();
+      throw new Error(`OpenAI TTS request failed (${response.status})${detail ? ": " + detail : ""}`);
+    }
+    return { base64: Buffer.from(await response.arrayBuffer()).toString("base64"), mimeType: "audio/mpeg" };
+  } catch (error) {
+    if (controller.signal.aborted) throw new Cancelled();
+    if (signal.aborted) throw new Error("OpenAI TTS request timed out");
+    throw error;
+  } finally {
+    const set = session ? inFlight.get(session) : undefined;
+    set?.delete(controller);
+    if (session && set?.size === 0) inFlight.delete(session);
+  }
 }
 
 // ---------- Local voices ----------
@@ -38,7 +80,12 @@ async function synthesizeOpenAi(voice: OpenAiVoice, text: string): Promise<Speec
 type Audio = { samples: Float32Array | number[]; sampleRate: number };
 interface LocalEngine {
   generate(text: string, sid: number, speed: number): Promise<Audio>;
+  /** Releases the model's memory, when the runtime offers a way to. */
+  dispose(): void;
 }
+
+/** More threads make each chunk faster; leave headroom for the agents themselves. */
+const NATIVE_THREADS = Math.max(2, Math.min(4, (os.availableParallelism?.() ?? os.cpus().length) - 1));
 
 /** The engine block of sherpa's TTS config, built the way Paseo's voice mode builds it. */
 function modelBlock(dir: string, engine: TtsEngine) {
@@ -68,7 +115,9 @@ function modelBlock(dir: string, engine: TtsEngine) {
  */
 function nativeEngine(voice: LocalVoice): LocalEngine | null {
   const specifier = ["sherpa-onnx", "node"].join("-");
-  let sherpa: { OfflineTts?: new (config: unknown) => { generateAsync(input: object): Promise<Audio> } };
+  let sherpa: {
+    OfflineTts?: new (config: unknown) => { generateAsync(input: object): Promise<Audio>; free?: () => void };
+  };
   try {
     sherpa = require(specifier);
   } catch {
@@ -76,13 +125,15 @@ function nativeEngine(voice: LocalVoice): LocalEngine | null {
   }
   if (typeof sherpa.OfflineTts !== "function") return null;
   const tts = new sherpa.OfflineTts({
-    model: { numThreads: 2, debug: false, provider: "cpu", ...modelBlock(voice.dir, voice.engine) },
+    model: { numThreads: NATIVE_THREADS, debug: false, provider: "cpu", ...modelBlock(voice.dir, voice.engine) },
     maxNumSentences: 1,
     ruleFsts: voice.engine.family === "kokoro" ? (voice.engine.ruleFsts ?? []).map((name) => path.join(voice.dir, name)).join(",") : "",
   });
   return {
     // Electron rejects native external buffers, so ask sherpa for a copied array.
     generate: (text, sid, speed) => tts.generateAsync({ text, sid, speed, enableExternalBuffer: false }),
+    // Without free(), dropping the last reference lets the addon's finalizer release it.
+    dispose: () => tts.free?.(),
   };
 }
 
@@ -109,7 +160,7 @@ function wasmEngine(voice: LocalVoice): LocalEngine {
   if (!home) throw new Error("Read Aloud could not find its installed files to load the speech engine.");
   // The bundle has no import.meta or __dirname, so resolve from the installed plugin directory.
   const sherpa = createRequire(path.join(home, "package.json"))("sherpa-onnx") as {
-    createOfflineTts(config: unknown): { generate(input: object): Audio };
+    createOfflineTts(config: unknown): { generate(input: object): Audio; free?: () => void };
   };
   const block = modelBlock(voice.dir, voice.engine);
   const wasmBlock =
@@ -117,7 +168,7 @@ function wasmEngine(voice: LocalVoice): LocalEngine {
     : "kitten" in block ? { offlineTtsKittenModelConfig: block.kitten }
     : { offlineTtsVitsModelConfig: { ...block.vits, lexicon: "", noiseScale: 0.667, noiseScaleW: 0.8 } };
   const tts = sherpa.createOfflineTts({ offlineTtsModelConfig: { numThreads: 1, debug: false, ...wasmBlock } });
-  return { generate: async (text, sid, speed) => tts.generate({ text, sid, speed }) };
+  return { generate: async (text, sid, speed) => tts.generate({ text, sid, speed }), dispose: () => tts.free?.() };
 }
 
 let engine: { key: string; ready: Promise<LocalEngine> } | null = null;
@@ -126,9 +177,25 @@ let engineError: { key: string; message: string } | null = null;
 /** The native handle is not reentrant: run one generation at a time. */
 let queue: Promise<unknown> = Promise.resolve();
 
+/** Frees an engine once every generation already queued on it has finished. */
+function retire(old: { ready: Promise<LocalEngine> }) {
+  const drained = queue;
+  void Promise.all([old.ready, drained])
+    .then(([local]) => local.dispose())
+    .catch(() => undefined);
+}
+
+/** Frees the loaded voice (plugin stop). */
+export function disposeEngine() {
+  if (engine) retire(engine);
+  engine = null;
+}
+
 function localEngine(voice: LocalVoice): Promise<LocalEngine> {
   const key = voice.dir + "|" + voice.modelId;
   if (engine?.key === key) return engine.ready;
+  // Switching voices: let the old model go instead of keeping both in memory.
+  if (engine) retire(engine);
   const ready = (async () => {
     const missing = requiredFiles(voice.engine).filter((name) => !fs.existsSync(path.join(voice.dir, name)));
     if (missing.length) {
@@ -151,12 +218,29 @@ function localEngine(voice: LocalVoice): Promise<LocalEngine> {
   return ready;
 }
 
-/** Float32 samples in -1..1 to a 16-bit PCM mono WAV file. */
-function encodeWav(samples: ArrayLike<number>, sampleRate: number): Buffer {
-  const dataSize = samples.length * 2;
-  const buffer = Buffer.alloc(44 + dataSize);
+/**
+ * Cuts the near-silence models pad each clip with, keeping a short natural lead-in and pause.
+ * Back-to-back clips then sound like continuous speech, and the first word arrives sooner.
+ */
+function trimSilence(samples: ArrayLike<number>, sampleRate: number): { start: number; end: number } {
+  const threshold = 0.01;
+  let start = 0;
+  let end = samples.length;
+  while (start < end && Math.abs(samples[start]) < threshold) start++;
+  while (end > start && Math.abs(samples[end - 1]) < threshold) end--;
+  if (start >= end) return { start: 0, end: 0 };
+  return {
+    start: Math.max(0, start - Math.round(sampleRate * 0.03)),
+    end: Math.min(samples.length, end + Math.round(sampleRate * 0.12)),
+  };
+}
+
+/** Float32 samples in -1..1 (a slice of them) to a 16-bit PCM mono WAV file. */
+function encodeWav(samples: ArrayLike<number>, sampleRate: number, start = 0, end = samples.length): Buffer {
+  const count = Math.max(0, end - start);
+  const buffer = Buffer.alloc(44 + count * 2);
   buffer.write("RIFF", 0);
-  buffer.writeUInt32LE(36 + dataSize, 4);
+  buffer.writeUInt32LE(36 + count * 2, 4);
   buffer.write("WAVE", 8);
   buffer.write("fmt ", 12);
   buffer.writeUInt32LE(16, 16);
@@ -167,33 +251,48 @@ function encodeWav(samples: ArrayLike<number>, sampleRate: number): Buffer {
   buffer.writeUInt16LE(2, 32);
   buffer.writeUInt16LE(16, 34);
   buffer.write("data", 36);
-  buffer.writeUInt32LE(dataSize, 40);
-  for (let i = 0; i < samples.length; i++) {
-    const value = Math.max(-1, Math.min(1, samples[i]));
-    buffer.writeInt16LE(Math.round(value < 0 ? value * 0x8000 : value * 0x7fff), 44 + i * 2);
+  buffer.writeUInt32LE(count * 2, 40);
+  // Write through a typed view (WAV is little-endian, as are the hosts Paseo runs on).
+  const pcm = new Int16Array(buffer.buffer, buffer.byteOffset + 44, count);
+  for (let i = 0; i < count; i++) {
+    const value = Math.max(-1, Math.min(1, samples[start + i]));
+    pcm[i] = Math.round(value < 0 ? value * 0x8000 : value * 0x7fff);
   }
   return buffer;
 }
 
-async function synthesizeLocal(voice: LocalVoice, text: string): Promise<SpeechFile> {
+async function synthesizeLocal(voice: LocalVoice, text: string, session?: string): Promise<SpeechFile> {
   const local = await localEngine(voice);
-  const run = queue.then(() => local.generate(text, voice.speakerId, voice.speed));
+  // Chunks from a stopped press are skipped when their turn comes, so a new press isn't stuck
+  // behind them.
+  const run = queue.then(() => {
+    if (isCancelled(session)) throw new Cancelled();
+    return local.generate(text, voice.speakerId, voice.speed);
+  });
   queue = run.catch(() => undefined);
   const audio = await run;
-  return { base64: encodeWav(audio.samples, audio.sampleRate).toString("base64"), mimeType: "audio/wav" };
+  const { start, end } = trimSilence(audio.samples, audio.sampleRate);
+  return {
+    base64: encodeWav(audio.samples, audio.sampleRate, start, end).toString("base64"),
+    mimeType: "audio/wav",
+    durationMs: ((end - start) / audio.sampleRate) * 1000,
+  };
 }
 
 /** Speaks one chunk with the voice chosen in Paseo's voice settings. */
-export async function synthesize({ text }: { text: string }): Promise<SpeechFile> {
+export async function synthesize({ text, session }: { text: string; session?: string }): Promise<SpeechFile> {
   if (!text.trim()) throw new Error("Nothing to read aloud");
+  if (isCancelled(session)) throw new Cancelled();
   const voice = resolveVoice();
-  return voice.provider === "openai" ? synthesizeOpenAi(voice, text) : synthesizeLocal(voice, text);
+  return voice.provider === "openai" ? synthesizeOpenAi(voice, text, session) : synthesizeLocal(voice, text, session);
 }
 
 const SPEAKING_SETTINGS = "Open Paseo Settings, choose Voice, and find Voice mode > Speaking.";
 
-/** Checks the voice Paseo would use, without loading it, and says how to fix any problem. */
-export async function checkVoice(): Promise<{ ok: boolean; voice: string; problem?: string; steps?: string[] }> {
+/** Checks the voice Paseo would use and says how to fix any problem; warms a working local voice. */
+type Status = { ok: boolean; voice: string; provider?: "local" | "openai" | "unknown"; problem?: string; steps?: string[] };
+
+export async function checkVoice(): Promise<Status> {
   let voice: ResolvedVoice;
   try {
     voice = resolveVoice();
@@ -201,15 +300,17 @@ export async function checkVoice(): Promise<{ ok: boolean; voice: string; proble
     return {
       ok: false,
       voice: "Unknown voice",
+      provider: "unknown",
       problem: error instanceof Error ? error.message : "Paseo's voice settings couldn't be read.",
       steps: [SPEAKING_SETTINGS, "Set Provider to Local or OpenAI and pick a voice from the Model list.", "Tap this warning again to re-check."],
     };
   }
   if (voice.provider === "openai") {
-    if (voice.apiKey) return { ok: true, voice: `OpenAI ${voice.voice}` };
+    if (voice.apiKey) return { ok: true, voice: `OpenAI ${voice.voice}`, provider: "openai" };
     return {
       ok: false,
       voice: `OpenAI ${voice.voice}`,
+      provider: "openai",
       problem: "OpenAI is selected for speaking, but no API key is saved.",
       steps: [SPEAKING_SETTINGS, "Enter your OpenAI API key and press Save, or switch Provider to Local.", "Tap this warning again to re-check."],
     };
@@ -219,6 +320,7 @@ export async function checkVoice(): Promise<{ ok: boolean; voice: string; proble
     return {
       ok: false,
       voice: voice.label,
+      provider: "local",
       problem: `The selected voice, ${voice.label}, isn't downloaded.`,
       steps: [
         SPEAKING_SETTINGS,
@@ -232,6 +334,7 @@ export async function checkVoice(): Promise<{ ok: boolean; voice: string; proble
     return {
       ok: false,
       voice: voice.label,
+      provider: "local",
       problem: `${voice.label} is downloaded but couldn't be loaded: ${engineError.message}`,
       steps: [
         SPEAKING_SETTINGS,
@@ -240,5 +343,8 @@ export async function checkVoice(): Promise<{ ok: boolean; voice: string; proble
       ],
     };
   }
-  return { ok: true, voice: voice.label };
+  // A chat with replies is open: load the voice now so the first press only has to generate.
+  // Failures surface on the next status check, like any other load error.
+  setTimeout(() => void localEngine(voice).catch(() => undefined), 0);
+  return { ok: true, voice: voice.label, provider: "local" };
 }

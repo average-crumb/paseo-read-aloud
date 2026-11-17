@@ -1,7 +1,8 @@
 {
   "name": "paseo-read-aloud",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
+  "license": "MIT",
   "repository": {
     "type": "git",
     "url": "https://github.com/average-crumb/paseo-read-aloud"
@@ -15,10 +16,12 @@
     "client/",
     "server/",
     "shared/",
-    "assets/"
+    "assets/",
+    "LICENSE"
   ],
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node --import ./test/resolve-ts.mjs --experimental-strip-types --no-warnings --test test/*.test.ts"
   },
   "devDependencies": {
     "@getpaseo/plugin": "0.15.4",
